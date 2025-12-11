@@ -7,13 +7,25 @@ from pathlib import Path
 
 # 路径配置：要和训练脚本保持一致
 MODEL_PATH = Path("./pose2base_robot_transformer_best.pt")
-DATA_PATH = Path("./robot_training_data.csv")
+DATA_PATH = Path("./data/robot_training_data_expanded.csv")
 SPLIT_PATH = Path("./split_indices.npz")
+
+DEFAULT_MODELS_DIR = Path("./models")
+DEFAULT_OUTPUTS_DIR = Path("./outputs")
+
+# 在项目根目录下运行，exp 名为训练时的 --model-name
+# python -u predict_pose2base.py --model-name my_experiment --device cpu
+
+# python -u predict_pose2base.py \
+#   --model models/my_experiment/model.pt \
+#   --data ./data/robot_training_data_expanded.csv \
+#   --split outputs/my_experiment/split_indices.npz \
+#   --device cuda
 
 # 预测集控制：避免对超大 CSV 全量推理
 # PRED_USE_VAL=1 时优先使用 split_indices.npz 中的 val_idx；设为 0 则改为采样
 # PRED_SAMPLE_LIMIT 控制最多使用多少行（对 val 集也生效）；默认 2000 行
-PRED_USE_VAL = os.environ.get("PRED_USE_VAL", "1")
+PRED_USE_VAL = os.environ.get("PRED_USE_VAL", "0")
 PRED_SAMPLE_LIMIT = int(os.environ.get("PRED_SAMPLE_LIMIT", "2000"))
 
 
@@ -42,7 +54,7 @@ class PoseToBaseTransformer(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
@@ -79,7 +91,7 @@ class PoseToBaseTransformer(nn.Module):
 def load_model(preferred_device: str = "cpu"):
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"找不到模型文件 {MODEL_PATH}，请先运行训练脚本 train_pose2base_stable.py"
+            f"找不到模型文件 {MODEL_PATH}，请先运行训练脚本并确认模型路径或使用 --model 参数"
         )
 
     ckpt = torch.load(MODEL_PATH, map_location="cpu")
@@ -122,7 +134,7 @@ def load_model(preferred_device: str = "cpu"):
     print("best_epoch:", ckpt.get("epoch", None))
     print("device:", device)
 
-    return model, device, x_mean, x_std, y_mean, y_std
+    return model, device, x_mean, x_std, y_mean, y_std, ckpt
 
 
 # =============== 特征构造：必须和训练完全一致 ===============
@@ -273,9 +285,76 @@ def eval_on_val_set(model, device, x_mean, x_std, y_mean, y_std):
     print("【验证集】整体 MAE [x, y, z]:", mae.tolist())
 
 def main():
-    # 可通过环境变量 PRED_DEVICE 强制 cpu/cuda；默认 cpu 更稳妥
-    preferred_device = os.environ.get("PRED_DEVICE", "cpu").lower()
-    model, device, x_mean, x_std, y_mean, y_std = load_model(preferred_device)
+    import argparse
+    # 声明我们将在函数内修改这些全局路径变量
+    global MODEL_PATH, DATA_PATH, SPLIT_PATH
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default=str(MODEL_PATH), help="模型文件路径")
+    parser.add_argument("--data", type=str, default=str(DATA_PATH), help="CSV 数据文件路径")
+    parser.add_argument("--split", type=str, default=str(SPLIT_PATH), help="split_indices.npz 路径")
+    parser.add_argument("--model-name", type=str, default=None,
+                        help="实验目录名或路径（优先），脚本会从中加载 model.pt 和 split_indices.npz")
+    parser.add_argument("--device", type=str, default=os.environ.get("PRED_DEVICE", "cpu"),
+                        help="优先使用的设备 cpu/cuda")
+    parser.add_argument("--allow-mismatch", action="store_true",
+                        help="允许训练时样本数与当前 CSV 行数不匹配（跳过校验）")
+    args = parser.parse_args()
+
+    # 若提供了 --model-name 优先依据该实验目录查找 artifact
+    if args.model_name:
+        exp = Path(args.model_name)
+        # 如果用户传入的是模型目录（绝对或相对），优先使用其中的 model.pt
+        if exp.is_dir():
+            if (exp / "model.pt").exists():
+                MODEL_PATH = exp / "model.pt"
+            else:
+                # 如果用户传入的是 experiment name, 先在 default models/outputs 下查找
+                candidate = DEFAULT_MODELS_DIR / exp.name / "model.pt"
+                if candidate.exists():
+                    MODEL_PATH = candidate
+        else:
+            # exp 可能是 experiment name; try defaults
+            candidate = DEFAULT_MODELS_DIR / args.model_name / "model.pt"
+            if candidate.exists():
+                MODEL_PATH = candidate
+
+        # determine split path under outputs
+        candidate_split = DEFAULT_OUTPUTS_DIR / (Path(args.model_name).name) / "split_indices.npz"
+        if candidate_split.exists():
+            SPLIT_PATH = candidate_split
+
+    # 更新全局路径（命令行参数覆盖默认）
+    MODEL_PATH = Path(args.model) if Path(args.model).exists() else MODEL_PATH
+    DATA_PATH = Path(args.data)
+    SPLIT_PATH = Path(args.split) if Path(args.split).exists() else SPLIT_PATH
+
+    preferred_device = args.device.lower()
+    model, device, x_mean, x_std, y_mean, y_std, ckpt = load_model(preferred_device)
+
+    # 校验 checkpoint 中保存的训练样本数与当前数据集的大小是否一致
+    parser_check = argparse.ArgumentParser(add_help=False)
+    parser_check.add_argument("--allow-mismatch", action="store_true",
+                              help="允许训练时样本数与当前 CSV 行数不匹配（跳过校验）")
+    # 解析仅为获取该 flag（位于 sys.argv）
+    try:
+        args_check, _ = parser_check.parse_known_args()
+    except Exception:
+        args_check = type('X', (), {'allow_mismatch': False})()
+
+    if 'n_samples' in ckpt:
+        try:
+            # 读取 CSV 行数（保守方式：读取并 dropna 后计数）
+            df_count = pd.read_csv(DATA_PATH, usecols=["end_pos_x"]).shape[0]
+        except Exception:
+            df_count = None
+
+        ckpt_n = int(ckpt.get('n_samples', -1))
+        if df_count is not None and ckpt_n != df_count and not args_check.allow_mismatch:
+            print("[ERROR] checkpoint 中记录的训练样本数与当前 CSV 行数不一致。")
+            print(f"  checkpoint n_samples={ckpt_n}, current CSV rows={df_count}")
+            print("如果你确认要忽略此差异，请使用 --allow-mismatch 参数或指定正确的 --split/--model 文件")
+            return
     demo_manual_input(model, device, x_mean, x_std, y_mean, y_std)
     demo_from_csv(model, device, x_mean, x_std, y_mean, y_std)
     eval_on_val_set(model, device, x_mean, x_std, y_mean, y_std)

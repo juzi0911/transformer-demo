@@ -3,19 +3,32 @@ import time
 from tqdm import tqdm
 import torch
 import torch.nn as nn
-from torch.cuda import amp as cuda_amp
+import torch.amp as amp
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 from pathlib import Path
 import random
 
-DATA_PATH = Path("./robot_training_data.csv")
-MODEL_PATH = Path("./pose2base_robot_transformer_best.pt")
-SPLIT_PATH = Path("./split_indices.npz")  # 固定 train/val 划分用
+DATA_PATH = Path("./data/robot_training_data_expanded.csv")
 
-# python -u train_pose2base.py --debug-nrows 10000 --epochs 2 --batch-size 128 --num-workers 2 --amp auto
-# python -u train_pose2base.py --epochs 100 --batch-size 256 --num-workers 4 --amp auto
+DEFAULT_MODELS_DIR = Path("./models")
+DEFAULT_OUTPUTS_DIR = Path("./outputs")
+
+# python -u train_pose2base.py \
+#   --model-name my_experiment \
+#   --debug-nrows 10000 \
+#   --epochs 2 \
+#   --batch-size 128 \
+#   --num-workers 2 \
+#   --amp auto 
+
+# python -u train_pose2base.py \
+#   --model-name full_train \
+#   --epochs 200 \
+#   --batch-size 256 \
+#   --num-workers 8 \
+#   --amp auto
 
 # =============== 固定随机种子 ===============
 
@@ -100,7 +113,7 @@ class PoseToBaseTransformer(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
@@ -176,6 +189,8 @@ def compute_mae_physical(model, loader, device, y_mean, y_std):
 
 def main():
     set_seed(42)
+    # 声明将在本函数修改的全局路径变量，必须在首次使用这些名字之前声明
+    global DATA_PATH, MODEL_PATH, SPLIT_PATH
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -184,7 +199,46 @@ def main():
                         help="只读取前 n 行用于快速调试")
     parser.add_argument("--amp", choices=["auto", "true", "false"], default="auto",
                         help="是否使用混合精度: auto/true/false（auto 在有 CUDA 时启用）")
+    parser.add_argument("--data-path", type=str, default=str(DATA_PATH),
+                        help="训练数据 CSV 文件路径")
+    parser.add_argument("--models-dir", type=str, default=str(DEFAULT_MODELS_DIR),
+                        help="保存模型的目录")
+    parser.add_argument("--outputs-dir", type=str, default=str(DEFAULT_OUTPUTS_DIR),
+                        help="保存 split 等产物的目录")
+    parser.add_argument("--model-name", type=str, default=None,
+                        help="模型文件名（例如 mymodel.pt）。如果为空则使用默认名")
     args = parser.parse_args()
+
+    # 根据传入参数设置路径并确保目录存在
+    DATA_PATH = Path(args.data_path)
+    models_dir = Path(args.models_dir)
+    outputs_dir = Path(args.outputs_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    # model name: 如果用户没提供，使用带时间戳的默认名，避免覆盖
+    if args.model_name:
+        model_name = args.model_name
+        if not model_name.endswith('.pt'):
+            model_name = model_name + '.pt'
+    else:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = f"pose2base_{ts}.pt"
+
+    # 将同一实验的 artifacts 放到以 model_name 为名的子文件夹中，便于管理多个实验
+    model_stem = model_name[:-3] if model_name.endswith('.pt') else model_name
+    exp_models_dir = models_dir / model_stem
+    exp_outputs_dir = outputs_dir / model_stem
+    exp_models_dir.mkdir(parents=True, exist_ok=True)
+    exp_outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use fixed model filename inside experiment folder to simplify references
+    MODEL_PATH = exp_models_dir / "model.pt"
+    SPLIT_PATH = exp_outputs_dir / "split_indices.npz"
+
+    # model tag: 标识是 full 训练还是 debug_nrows（提前定义，便于日志记录）
+    model_tag = f"debug_nrows={args.debug_nrows}" if args.debug_nrows is not None else "trained_on=full"
 
     dataset = PoseDataset(DATA_PATH, nrows=args.debug_nrows)
     n_samples = len(dataset)
@@ -227,15 +281,15 @@ def main():
         dropout=0.1,
     ).to(device)
 
-    # 决定是否使用 AMP
+    # 决定是否使用 AMP：仅在有 CUDA 时启用混合精度
     if args.amp == "true":
-        use_amp = True
+        use_amp = (device.type == "cuda")
     elif args.amp == "false":
         use_amp = False
     else:
-        use_amp = torch.cuda.is_available()
+        use_amp = (device.type == "cuda")
 
-    scaler = cuda_amp.GradScaler() if use_amp else None
+    scaler = amp.GradScaler() if use_amp else None
 
     # 根据当前硬件给出建议（仅打印）
     cpu_count = None
@@ -259,6 +313,8 @@ def main():
 
     best_val_mse = float("inf")
     best_state = None
+    # 用于保存每个 epoch 的训练日志（稍后写入 outputs_dir/training_log.csv ）
+    training_logs = []
 
     for epoch in range(1, epochs + 1):
         # ----- train -----
@@ -275,7 +331,7 @@ def main():
 
             optimizer.zero_grad()
             if use_amp:
-                with cuda_amp.autocast():
+                with amp.autocast(device_type=device.type):
                     preds = model(X_batch)
                     loss = criterion(preds, y_batch)
                 scaler.scale(loss).backward()
@@ -306,7 +362,7 @@ def main():
                 X_batch = X_batch.to(device, non_blocking=True)
                 y_batch = y_batch.to(device, non_blocking=True)
                 if use_amp:
-                    with cuda_amp.autocast():
+                    with amp.autocast(device_type=device.type):
                         preds = model(X_batch)
                         loss = criterion(preds, y_batch)
                 else:
@@ -327,6 +383,8 @@ def main():
 
         if val_mse < best_val_mse:
             best_val_mse = val_mse
+            # model tag: 标识是 full 训练还是 debug_nrows
+            model_tag = f"debug_nrows={args.debug_nrows}" if args.debug_nrows is not None else "trained_on=full"
             best_state = {
                 "model_state_dict": model.state_dict(),
                 "x_mean": dataset.x_mean,
@@ -335,13 +393,67 @@ def main():
                 "y_std": dataset.y_std,
                 "best_val_mse": best_val_mse,
                 "epoch": epoch,
+                "n_samples": n_samples,
+                "model_tag": model_tag,
             }
 
         train_mae = compute_mae_physical(model, train_loader, device, dataset.y_mean, dataset.y_std)
         val_mae   = compute_mae_physical(model, val_loader,   device, dataset.y_mean, dataset.y_std)
+        epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch}: Train MAE {train_mae}, Val MAE {val_mae}")
 
+        # 记录日志行（扁平化 MAE 数组）
+        # 当前学习率（可能由调度器变化）
+        try:
+            current_lr = float(optimizer.param_groups[0]['lr'])
+        except Exception:
+            current_lr = None
+
+        training_logs.append({
+            "epoch": epoch,
+            "train_mse": float(train_mse),
+            "val_mse": float(val_mse),
+            "lr": current_lr,
+            "model_tag": model_tag,
+            "n_samples": int(n_samples),
+            "train_mae_x": float(train_mae[0]),
+            "train_mae_y": float(train_mae[1]),
+            "train_mae_z": float(train_mae[2]),
+            "val_mae_x": float(val_mae[0]),
+            "val_mae_y": float(val_mae[1]),
+            "val_mae_z": float(val_mae[2]),
+            "epoch_seconds": float(epoch_time),
+            "best_val_mse_so_far": float(best_val_mse),
+        })
+
     torch.save(best_state, MODEL_PATH)
+    # 保存训练日志到 outputs 目录，便于后续可视化
+    try:
+        logs_df = pd.DataFrame(training_logs)
+        # save logs to both outputs and models experiment folders
+        logs_path_out = exp_outputs_dir / "training_log.csv"
+        logs_path_model = exp_models_dir / "training_log.csv"
+        logs_df.to_csv(logs_path_out, index=False)
+        logs_df.to_csv(logs_path_model, index=False)
+        print(f"训练日志已保存: {logs_path_out} 和 {logs_path_model}")
+        # save metadata json in models experiment folder
+        meta = {
+            "model_name": model_name,
+            "model_tag": model_tag,
+            "n_samples": int(n_samples),
+            "best_val_mse": float(best_val_mse),
+            "epoch": int(best_state.get('epoch', -1)) if best_state else None,
+        }
+        try:
+            import json
+            meta_path = exp_models_dir / "metadata.json"
+            with open(meta_path, 'w') as f:
+                json.dump(meta, f, indent=2)
+            print(f"模型元数据已保存: {meta_path}")
+        except Exception as exc:
+            print(f"无法保存模型元数据: {exc}")
+    except Exception as exc:
+        print(f"无法保存训练日志: {exc}")
     print(f"训练完成，最佳 Val MSE = {best_val_mse:.6f}，模型已保存到: {MODEL_PATH}")
 
 
