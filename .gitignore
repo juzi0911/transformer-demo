@@ -1,1 +1,4 @@
 robot_training_data.csv
+split_indices.npz
+pose2base_robot_transformer_best.pt
+output.txt

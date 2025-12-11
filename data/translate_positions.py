@@ -19,6 +19,7 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 
+# python translate_positions.py --mode exhaustive --offset-range 5 --input robot_training_data.csv --output robot_training_data_offset5_exhaustive.csv
 
 REQUIRED_COLS = (
     "end_pos_x",

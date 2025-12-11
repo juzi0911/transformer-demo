@@ -14,6 +14,8 @@ DATA_PATH = Path("./robot_training_data.csv")
 MODEL_PATH = Path("./pose2base_robot_transformer_best.pt")
 SPLIT_PATH = Path("./split_indices.npz")  # 固定 train/val 划分用
 
+# python -u train_pose2base.py --debug-nrows 10000 --epochs 2 --batch-size 128 --num-workers 2 --amp auto
+# python -u train_pose2base.py --epochs 100 --batch-size 256 --num-workers 4 --amp auto
 
 # =============== 固定随机种子 ===============
 
