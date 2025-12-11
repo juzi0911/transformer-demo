@@ -8,6 +8,13 @@ from pathlib import Path
 # 路径配置：要和训练脚本保持一致
 MODEL_PATH = Path("./pose2base_robot_transformer_best.pt")
 DATA_PATH = Path("./robot_training_data.csv")
+SPLIT_PATH = Path("./split_indices.npz")
+
+# 预测集控制：避免对超大 CSV 全量推理
+# PRED_USE_VAL=1 时优先使用 split_indices.npz 中的 val_idx；设为 0 则改为采样
+# PRED_SAMPLE_LIMIT 控制最多使用多少行（对 val 集也生效）；默认 2000 行
+PRED_USE_VAL = os.environ.get("PRED_USE_VAL", "1")
+PRED_SAMPLE_LIMIT = int(os.environ.get("PRED_SAMPLE_LIMIT", "2000"))
 
 
 # =============== 模型结构（必须和训练时一模一样） ===============
@@ -203,15 +210,34 @@ def demo_from_csv(model, device, x_mean, x_std, y_mean, y_std):
         "base_pos_z",
     ]
 
-    df = df.dropna(subset=in_cols + out_cols)
-    df_sample = df.reset_index(drop=True)
+    df = df.dropna(subset=in_cols + out_cols).reset_index(drop=True)
+
+    # 仅使用验证集索引；如未提供则做子样本采样，避免 200w 行全量推理
+    df_sample = None
+    source = "sample"
+    if SPLIT_PATH.exists() and PRED_USE_VAL != "0":
+        split = np.load(SPLIT_PATH)
+        val_idx = split.get("val_idx", None)
+        if val_idx is not None:
+            val_idx = np.asarray(val_idx, dtype=np.int64)
+            val_idx = val_idx[val_idx < len(df)]
+            if PRED_SAMPLE_LIMIT > 0 and len(val_idx) > PRED_SAMPLE_LIMIT:
+                val_idx = val_idx[:PRED_SAMPLE_LIMIT]
+            if len(val_idx) > 0:
+                df_sample = df.loc[val_idx].reset_index(drop=True)
+                source = f"val_idx (capped {len(df_sample)})"
+
+    if df_sample is None:
+        sample_n = len(df) if PRED_SAMPLE_LIMIT <= 0 else min(PRED_SAMPLE_LIMIT, len(df))
+        df_sample = df.sample(n=sample_n, random_state=0).reset_index(drop=True)
+        source = f"random_sample {sample_n}"
 
     poses_raw = df_sample[in_cols].values.astype("float32")  # (M, 6)
     gt_base = df_sample[out_cols].values.astype("float32")   # (M, 3)
 
     preds = predict_from_poses(model, device, x_mean, x_std, y_mean, y_std, poses_raw)
 
-    print("===== 从 CSV 读取样本 → 真实 vs 预测 (stable baseline) =====")
+    print(f"===== 从 CSV 读取样本 → 真实 vs 预测 (stable baseline) | source: {source} | rows: {len(df_sample)} =====")
     for i in range(len(df_sample)):
         print(f"样本 #{i}")
         print("end  pose [x,y,z, rx,ry,rz]:", poses_raw[i].tolist())
@@ -221,8 +247,6 @@ def demo_from_csv(model, device, x_mean, x_std, y_mean, y_std):
 
     mae = np.mean(np.abs(preds - gt_base), axis=0)
     print("整体 MAE [x, y, z]:", mae.tolist())
-
-SPLIT_PATH = Path("./split_indices.npz")
 
 def eval_on_val_set(model, device, x_mean, x_std, y_mean, y_std):
     if (not DATA_PATH.exists()) or (not SPLIT_PATH.exists()):

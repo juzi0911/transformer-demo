@@ -51,13 +51,19 @@ def parse_args() -> argparse.Namespace:
         "--count",
         type=int,
         default=100_000,
-        help="Number of augmented rows to generate",
+        help="Number of augmented rows to generate (random mode only)",
     )
     parser.add_argument(
         "--offset-range",
         type=int,
         default=20,
         help="Max absolute integer offset applied to x/y/z",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["random", "exhaustive"],
+        default="random",
+        help="random: sample offsets uniformly; exhaustive: enumerate all integer offsets in range",
     )
     parser.add_argument(
         "--seed",
@@ -78,6 +84,13 @@ def generate_offsets(n: int, offset_range: int, seed: int | None) -> Tuple[np.nd
     rng = np.random.default_rng(seed)
     offsets = rng.integers(-offset_range, offset_range + 1, size=(n, 3))
     return offsets[:, 0], offsets[:, 1], offsets[:, 2]
+
+
+def generate_exhaustive_offsets(offset_range: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Produce all integer triples in [-r, r]^3 without repetition.
+    values = np.arange(-offset_range, offset_range + 1, dtype=int)
+    grid = np.stack(np.meshgrid(values, values, values, indexing="ij"), axis=-1).reshape(-1, 3)
+    return grid[:, 0], grid[:, 1], grid[:, 2]
 
 
 def apply_translation(df: pd.DataFrame, dx, dy, dz) -> pd.DataFrame:
@@ -112,17 +125,28 @@ def main() -> None:
     df = pd.read_csv(input_path)
     validate_columns(df)
 
-    # Sample with replacement to reach requested count.
-    sampled = df.sample(n=args.count, replace=True, random_state=args.seed).reset_index(drop=True)
-    dx, dy, dz = generate_offsets(args.count, args.offset_range, args.seed)
-    translated = apply_translation(sampled, dx, dy, dz)
+    if args.mode == "random":
+        # Sample with replacement to reach requested count.
+        sampled = df.sample(n=args.count, replace=True, random_state=args.seed).reset_index(drop=True)
+        dx, dy, dz = generate_offsets(args.count, args.offset_range, args.seed)
+        translated = apply_translation(sampled, dx, dy, dz)
+    else:  # exhaustive
+        dx, dy, dz = generate_exhaustive_offsets(args.offset_range)
+        num_offsets = len(dx)
+        # Repeat base data for every offset; ensures no offset duplicates.
+        sampled = df.loc[df.index.repeat(num_offsets)].reset_index(drop=True)
+        # Tile offsets to align with repeated rows.
+        dx_full = np.tile(dx, len(df))
+        dy_full = np.tile(dy, len(df))
+        dz_full = np.tile(dz, len(df))
+        translated = apply_translation(sampled, dx_full, dy_full, dz_full)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     translated.to_csv(output_path, index=False)
 
     print(
-        "Generated {count} rows with random integer offsets in ±{rng}. Output: {out}".format(
-            count=len(translated), rng=args.offset_range, out=output_path
+        "Generated {count} rows with {mode} integer offsets in ±{rng}. Output: {out}".format(
+            count=len(translated), mode=args.mode, rng=args.offset_range, out=output_path
         )
     )
 

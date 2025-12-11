@@ -1,5 +1,9 @@
+import argparse
+import time
+from tqdm import tqdm
 import torch
 import torch.nn as nn
+from torch.cuda import amp as cuda_amp
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
@@ -23,8 +27,12 @@ def set_seed(seed: int = 42):
 # =============== 数据集（pos + sin/cos） ===============
 
 class PoseDataset(Dataset):
-    def __init__(self, csv_path: Path):
-        df = pd.read_csv(csv_path)
+    def __init__(self, csv_path: Path, nrows: int = None):
+        # 支持只读取前 nrows 行，便于快速调试
+        if nrows is None:
+            df = pd.read_csv(csv_path)
+        else:
+            df = pd.read_csv(csv_path, nrows=nrows)
 
         pos_cols = ["end_pos_x", "end_pos_y", "end_pos_z"]
         ang_cols = ["end_pose_x", "end_pose_y", "end_pose_z"]
@@ -125,7 +133,11 @@ def get_train_val_indices(n_samples: int, train_ratio: float = 0.8):
         data = np.load(SPLIT_PATH)
         train_idx = data["train_idx"]
         val_idx = data["val_idx"]
-        return train_idx, val_idx
+        # 如果已保存的索引不匹配当前样本数（例如调试只读前几行），则重新生成划分
+        if len(train_idx) == n_samples:
+            return train_idx, val_idx
+        else:
+            print("Saved split does not match current dataset size -> regenerating split")
 
     # 第一次：生成并保存
     indices = np.arange(n_samples)
@@ -162,8 +174,17 @@ def compute_mae_physical(model, loader, device, y_mean, y_std):
 
 def main():
     set_seed(42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--debug-nrows", type=int, default=None,
+                        help="只读取前 n 行用于快速调试")
+    parser.add_argument("--amp", choices=["auto", "true", "false"], default="auto",
+                        help="是否使用混合精度: auto/true/false（auto 在有 CUDA 时启用）")
+    args = parser.parse_args()
 
-    dataset = PoseDataset(DATA_PATH)
+    dataset = PoseDataset(DATA_PATH, nrows=args.debug_nrows)
     n_samples = len(dataset)
 
     train_idx, val_idx = get_train_val_indices(n_samples, train_ratio=0.8)
@@ -181,8 +202,17 @@ def main():
         torch.from_numpy(val_X), torch.from_numpy(val_y)
     )
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
+    use_cuda = torch.cuda.is_available()
+    pin_memory = True if use_cuda else False
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PoseToBaseTransformer(
@@ -195,9 +225,35 @@ def main():
         dropout=0.1,
     ).to(device)
 
+    # 决定是否使用 AMP
+    if args.amp == "true":
+        use_amp = True
+    elif args.amp == "false":
+        use_amp = False
+    else:
+        use_amp = torch.cuda.is_available()
+
+    scaler = cuda_amp.GradScaler() if use_amp else None
+
+    # 根据当前硬件给出建议（仅打印）
+    cpu_count = None
+    try:
+        import os
+        cpu_count = os.cpu_count() or 1
+    except Exception:
+        cpu_count = 1
+
+    suggested_num_workers = min(8, max(0, cpu_count // 2))
+    suggested_batch = 256 if torch.cuda.is_available() else 64
+    print("Training suggestions:")
+    print(f"  - Detected device: {device}")
+    print(f"  - Suggested batch_size: {suggested_batch} (adjust for your GPU memory)")
+    print(f"  - Suggested num_workers: {suggested_num_workers}")
+    print(f"  - Mixed precision (AMP) suggested: {use_amp}")
+
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    epochs = 200
+    epochs = args.epochs
 
     best_val_mse = float("inf")
     best_state = None
@@ -206,29 +262,60 @@ def main():
         # ----- train -----
         model.train()
         train_loss_sum = 0.0
-        for X_batch, y_batch in train_loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
+        processed = 0
+        epoch_start = time.time()
+
+        train_iter = train_loader
+        train_bar = tqdm(train_iter, desc=f"Epoch {epoch} Train", leave=False)
+        for X_batch, y_batch in train_bar:
+            X_batch = X_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            preds = model(X_batch)
-            loss = criterion(preds, y_batch)
-            loss.backward()
-            optimizer.step()
+            if use_amp:
+                with cuda_amp.autocast():
+                    preds = model(X_batch)
+                    loss = criterion(preds, y_batch)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                preds = model(X_batch)
+                loss = criterion(preds, y_batch)
+                loss.backward()
+                optimizer.step()
 
-            train_loss_sum += loss.item() * X_batch.size(0)
+            bsize = X_batch.size(0)
+            train_loss_sum += loss.item() * bsize
+            processed += bsize
+            elapsed = time.time() - epoch_start
+            samples_per_sec = processed / elapsed if elapsed > 0 else 0.0
+            train_bar.set_postfix(loss=loss.item(), samples_per_sec=f"{samples_per_sec:.1f}")
         train_mse = train_loss_sum / len(train_ds)
 
         # ----- val -----
         model.eval()
         val_loss_sum = 0.0
+        val_processed = 0
+        val_epoch_start = time.time()
+        val_bar = tqdm(val_loader, desc=f"Epoch {epoch} Val", leave=False)
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch = X_batch.to(device)
-                y_batch = y_batch.to(device)
-                preds = model(X_batch)
-                loss = criterion(preds, y_batch)
-                val_loss_sum += loss.item() * X_batch.size(0)
+            for X_batch, y_batch in val_bar:
+                X_batch = X_batch.to(device, non_blocking=True)
+                y_batch = y_batch.to(device, non_blocking=True)
+                if use_amp:
+                    with cuda_amp.autocast():
+                        preds = model(X_batch)
+                        loss = criterion(preds, y_batch)
+                else:
+                    preds = model(X_batch)
+                    loss = criterion(preds, y_batch)
+                bsize = X_batch.size(0)
+                val_loss_sum += loss.item() * bsize
+                val_processed += bsize
+                velapsed = time.time() - val_epoch_start
+                v_sps = val_processed / velapsed if velapsed > 0 else 0.0
+                val_bar.set_postfix(loss=loss.item(), samples_per_sec=f"{v_sps:.1f}")
         val_mse = val_loss_sum / len(val_ds)
 
         print(
