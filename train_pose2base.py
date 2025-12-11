@@ -39,45 +39,54 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 
+# =============== 特征构造 ===============
+
+def load_xy_from_csv(csv_path: Path, nrows: int = None):
+    """
+    读取 CSV，返回 (X, y)。
+    X: [pos, sin(angles), cos(angles)] -> (N, 9)
+    y: base_pos -> (N, 3)
+    """
+    if nrows is None:
+        df = pd.read_csv(csv_path)
+    else:
+        df = pd.read_csv(csv_path, nrows=nrows)
+
+    pos_cols = ["end_pos_x", "end_pos_y", "end_pos_z"]
+    ang_cols = ["end_pose_x", "end_pose_y", "end_pose_z"]
+    out_cols = ["base_pos_x", "base_pos_y", "base_pos_z"]
+
+    df = df.dropna(subset=pos_cols + ang_cols + out_cols)
+
+    pos = df[pos_cols].values.astype("float32")
+    ang_deg = df[ang_cols].values.astype("float32")
+    ang_rad = np.deg2rad(ang_deg)
+    ang_sin = np.sin(ang_rad)
+    ang_cos = np.cos(ang_rad)
+
+    X = np.concatenate([pos, ang_sin, ang_cos], axis=1)  # (N, 9)
+    y = df[out_cols].values.astype("float32")            # (N, 3)
+    return X, y
+
+
 # =============== 数据集（pos + sin/cos） ===============
 
 class PoseDataset(Dataset):
-    def __init__(self, csv_path: Path, nrows: int = None):
-        # 支持只读取前 nrows 行，便于快速调试
-        if nrows is None:
-            df = pd.read_csv(csv_path)
-        else:
-            df = pd.read_csv(csv_path, nrows=nrows)
+    def __init__(self, X: np.ndarray, y: np.ndarray, stats):
+        """
+        X, y: 原始数组（未标准化）
+        stats: (x_mean, x_std, y_mean, y_std) —— 应基于训练集计算
+        """
+        self.X = X.astype("float32")
+        self.y = y.astype("float32")
+        self.x_mean, self.x_std, self.y_mean, self.y_std = stats
 
-        pos_cols = ["end_pos_x", "end_pos_y", "end_pos_z"]
-        ang_cols = ["end_pose_x", "end_pose_y", "end_pose_z"]
-        out_cols = ["base_pos_x", "base_pos_y", "base_pos_z"]
+        self.X_norm = (self.X - self.x_mean) / self.x_std
+        self.y_norm = (self.y - self.y_mean) / self.y_std
 
-        df = df.dropna(subset=pos_cols + ang_cols + out_cols)
-
-        pos = df[pos_cols].values.astype("float32")
-        ang_deg = df[ang_cols].values.astype("float32")
-        ang_rad = np.deg2rad(ang_deg)
-        ang_sin = np.sin(ang_rad)
-        ang_cos = np.cos(ang_rad)
-
-        X = np.concatenate([pos, ang_sin, ang_cos], axis=1)  # (N, 9)
-        y = df[out_cols].values.astype("float32")            # (N, 3)
-
-        self.X = X
-        self.y = y
-        self.n_samples = X.shape[0]
-        self.in_dim = X.shape[1]
-        self.out_dim = y.shape[1]
-
-        # 归一化参数
-        self.x_mean = X.mean(axis=0, keepdims=True)
-        self.x_std = X.std(axis=0, keepdims=True) + 1e-8
-        self.y_mean = y.mean(axis=0, keepdims=True)
-        self.y_std = y.std(axis=0, keepdims=True) + 1e-8
-
-        self.X_norm = (X - self.x_mean) / self.x_std
-        self.y_norm = (y - self.y_mean) / self.y_std
+        self.n_samples = self.X.shape[0]
+        self.in_dim = self.X.shape[1]
+        self.out_dim = self.y.shape[1]
 
     def __len__(self):
         return self.n_samples
@@ -207,6 +216,22 @@ def main():
                         help="保存 split 等产物的目录")
     parser.add_argument("--model-name", type=str, default=None,
                         help="模型文件名（例如 mymodel.pt）。如果为空则使用默认名")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="从 checkpoint 路径恢复训练")
+    parser.add_argument("--save-every", type=int, default=0,
+                        help="每隔 N 个 epoch 额外保存一次 checkpoint（0 表示仅保存最佳模型）")
+    parser.add_argument("--lr-scheduler", choices=["plateau", "none"], default="plateau",
+                        help="学习率调度器类型：plateau 或 none")
+    parser.add_argument("--lr-factor", type=float, default=0.5,
+                        help="ReduceLROnPlateau 的衰减因子")
+    parser.add_argument("--lr-patience", type=int, default=10,
+                        help="ReduceLROnPlateau 的等待 epoch 数")
+    parser.add_argument("--lr-min", type=float, default=1e-6,
+                        help="ReduceLROnPlateau 的最小学习率")
+    parser.add_argument("--early-stop-patience", type=int, default=20,
+                        help="早停等待的 epoch 数 (val 指标未改善时累积)")
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0,
+                        help="早停判定的最小改善幅度 (val_mse 需至少降低该值)")
     args = parser.parse_args()
 
     # 根据传入参数设置路径并确保目录存在
@@ -240,44 +265,36 @@ def main():
     # model tag: 标识是 full 训练还是 debug_nrows（提前定义，便于日志记录）
     model_tag = f"debug_nrows={args.debug_nrows}" if args.debug_nrows is not None else "trained_on=full"
 
-    dataset = PoseDataset(DATA_PATH, nrows=args.debug_nrows)
-    n_samples = len(dataset)
+    # 读取原始特征 & 标签
+    X_all, y_all = load_xy_from_csv(DATA_PATH, nrows=args.debug_nrows)
+    n_samples = len(X_all)
 
     train_idx, val_idx = get_train_val_indices(n_samples, train_ratio=0.8)
 
-    # Subset 手动切分
-    train_X = dataset.X_norm[train_idx]
-    train_y = dataset.y_norm[train_idx]
-    val_X = dataset.X_norm[val_idx]
-    val_y = dataset.y_norm[val_idx]
+    # 仅用训练集计算归一化参数，避免数据泄露
+    x_mean = X_all[train_idx].mean(axis=0, keepdims=True)
+    x_std = X_all[train_idx].std(axis=0, keepdims=True) + 1e-8
+    y_mean = y_all[train_idx].mean(axis=0, keepdims=True)
+    y_std = y_all[train_idx].std(axis=0, keepdims=True) + 1e-8
+    train_stats = (x_mean, x_std, y_mean, y_std)
 
-    train_ds = torch.utils.data.TensorDataset(
-        torch.from_numpy(train_X), torch.from_numpy(train_y)
-    )
-    val_ds = torch.utils.data.TensorDataset(
-        torch.from_numpy(val_X), torch.from_numpy(val_y)
-    )
+    # 如果 resume，优先使用 checkpoint 中的归一化参数，确保一致
+    ckpt = None
+    start_epoch = 1
 
-    use_cuda = torch.cuda.is_available()
-    pin_memory = True if use_cuda else False
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=pin_memory,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin_memory,
-    )
+    # 提前准备数据集，但在确认最终 stats（若 resume 覆盖）后再创建
+    # 此处先不创建 dataset，等 resume 检查完成
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 定义模型
     model = PoseToBaseTransformer(
-        seq_len=dataset.in_dim,
+        seq_len=X_all.shape[1],
         d_model=64,
         nhead=4,
         num_layers=3,
         dim_feedforward=128,
-        out_dim=dataset.out_dim,
+        out_dim=y_all.shape[1],
         dropout=0.1,
     ).to(device)
 
@@ -290,6 +307,61 @@ def main():
         use_amp = (device.type == "cuda")
 
     scaler = amp.GradScaler() if use_amp else None
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    epochs = args.epochs
+    scheduler = None
+    if args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+            min_lr=args.lr_min,
+        )
+
+    # ====== 可选恢复 ======
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.exists():
+            print(f"[info] 从 checkpoint 恢复: {resume_path}")
+            ckpt = torch.load(resume_path, map_location="cpu")
+            # 如果 checkpoint 保存了归一化参数，覆盖本次计算的 stats，确保一致性
+            if all(k in ckpt for k in ["x_mean", "x_std", "y_mean", "y_std"]):
+                train_stats = (
+                    ckpt["x_mean"],
+                    ckpt["x_std"],
+                    ckpt["y_mean"],
+                    ckpt["y_std"],
+                )
+            # 加载模型 / 优化器 / scaler 状态
+            if "model_state_dict" in ckpt:
+                model.load_state_dict(ckpt["model_state_dict"])
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if scaler is not None and "scaler_state_dict" in ckpt and ckpt["scaler_state_dict"] is not None:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+        else:
+            print(f"[warn] 未找到 checkpoint: {resume_path}，将从头训练")
+
+    # 基于最终的 train_stats 创建标准化后的 Dataset / Loader
+    x_mean, x_std, y_mean, y_std = train_stats
+    train_ds = PoseDataset(X_all[train_idx], y_all[train_idx], train_stats)
+    val_ds = PoseDataset(X_all[val_idx], y_all[val_idx], train_stats)
+
+    use_cuda = (device.type == "cuda")
+    pin_memory = use_cuda
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
 
     # 根据当前硬件给出建议（仅打印）
     cpu_count = None
@@ -307,16 +379,16 @@ def main():
     print(f"  - Suggested num_workers: {suggested_num_workers}")
     print(f"  - Mixed precision (AMP) suggested: {use_amp}")
 
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    epochs = args.epochs
-
     best_val_mse = float("inf")
     best_state = None
+    if ckpt is not None:
+        best_val_mse = float(ckpt.get("best_val_mse", best_val_mse))
+        best_state = ckpt.get("best_state", best_state)
+    early_stop_counter = 0
     # 用于保存每个 epoch 的训练日志（稍后写入 outputs_dir/training_log.csv ）
     training_logs = []
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         # ----- train -----
         model.train()
         train_loss_sum = 0.0
@@ -381,26 +453,61 @@ def main():
             f"Train MSE: {train_mse:.6f} | Val MSE: {val_mse:.6f}"
         )
 
+        # 调度学习率
+        if scheduler is not None:
+            scheduler.step(val_mse)
+
         if val_mse < best_val_mse:
             best_val_mse = val_mse
             # model tag: 标识是 full 训练还是 debug_nrows
             model_tag = f"debug_nrows={args.debug_nrows}" if args.debug_nrows is not None else "trained_on=full"
             best_state = {
                 "model_state_dict": model.state_dict(),
-                "x_mean": dataset.x_mean,
-                "x_std": dataset.x_std,
-                "y_mean": dataset.y_mean,
-                "y_std": dataset.y_std,
+                "x_mean": x_mean,
+                "x_std": x_std,
+                "y_mean": y_mean,
+                "y_std": y_std,
                 "best_val_mse": best_val_mse,
                 "epoch": epoch,
                 "n_samples": n_samples,
                 "model_tag": model_tag,
             }
+            early_stop_counter = 0
+        else:
+            # 未提升则计数
+            if val_mse > best_val_mse - args.early_stop_min_delta:
+                early_stop_counter += 1
+            else:
+                early_stop_counter = 0
 
-        train_mae = compute_mae_physical(model, train_loader, device, dataset.y_mean, dataset.y_std)
-        val_mae   = compute_mae_physical(model, val_loader,   device, dataset.y_mean, dataset.y_std)
+        train_mae = compute_mae_physical(model, train_loader, device, y_mean, y_std)
+        val_mae   = compute_mae_physical(model, val_loader,   device, y_mean, y_std)
         epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch}: Train MAE {train_mae}, Val MAE {val_mae}")
+
+        # 早停检查
+        if args.early_stop_patience > 0 and early_stop_counter >= args.early_stop_patience:
+            print(f"[early-stop] 连续 {early_stop_counter} 个 epoch 验证集未改善，提前停止。")
+            break
+
+        # 额外 checkpoint（可选）
+        if args.save_every > 0 and epoch % args.save_every == 0:
+            ckpt_path = exp_models_dir / f"checkpoint_epoch{epoch}.pt"
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+                "best_val_mse": best_val_mse,
+                "best_state": best_state,
+                "x_mean": x_mean,
+                "x_std": x_std,
+                "y_mean": y_mean,
+                "y_std": y_std,
+                "n_samples": n_samples,
+                "model_tag": model_tag,
+            }, ckpt_path)
+            print(f"[ckpt] 保存 checkpoint: {ckpt_path}")
 
         # 记录日志行（扁平化 MAE 数组）
         # 当前学习率（可能由调度器变化）
@@ -425,6 +532,20 @@ def main():
             "epoch_seconds": float(epoch_time),
             "best_val_mse_so_far": float(best_val_mse),
         })
+
+    if best_state is None:
+        # 如果训练未找到更优值，也至少保存最后状态
+        best_state = {
+            "model_state_dict": model.state_dict(),
+            "x_mean": x_mean,
+            "x_std": x_std,
+            "y_mean": y_mean,
+            "y_std": y_std,
+            "best_val_mse": best_val_mse,
+            "epoch": epochs,
+            "n_samples": n_samples,
+            "model_tag": model_tag,
+        }
 
     torch.save(best_state, MODEL_PATH)
     # 保存训练日志到 outputs 目录，便于后续可视化
