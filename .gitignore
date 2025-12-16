@@ -3,5 +3,6 @@ split_indices.npz
 pose2base_robot_transformer_best.pt
 output.txt
 data/robot_training_data_expanded.csv
+data/robot_training_data_seq_expanded.csv
 models/
 outputs/
