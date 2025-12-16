@@ -10,6 +10,7 @@ Key differences vs train_pose2base.py:
 
 Usage example (project root):
   python -u train_pose2base_sequence.py \
+    --smooth-lambda 0.1 \
     --model-name seq_exp \
     --epochs 200 \
     --batch-size 256 \
@@ -216,6 +217,17 @@ def compute_mae_physical(pred_norm: np.ndarray, gt_norm: np.ndarray, y_mean: np.
     return np.mean(np.abs(pred - gt), axis=(0, 1))  # (3,)
 
 
+# =============== Smoothness ===============
+
+def smoothness_loss_pos(pred_pos: torch.Tensor) -> torch.Tensor:
+    """Second-order difference smoothness over x,y in physical space."""
+    p = pred_pos[..., :2]  # use x,y only
+    if p.size(1) < 3:
+        return p.new_tensor(0.0)
+    d2 = p[:, 2:, :] - 2.0 * p[:, 1:-1, :] + p[:, :-2, :]
+    return (d2 ** 2).mean()
+
+
 # =============== Training ===============
 
 def train_loop(
@@ -236,8 +248,11 @@ def train_loop(
     save_every: int,
     early_stop_patience: int,
     early_stop_min_delta: float,
+    smooth_lambda: float,
 ):
     criterion = nn.MSELoss()
+    y_mean_t = torch.tensor(y_mean, dtype=torch.float32, device=device).view(1, 1, -1)
+    y_std_t = torch.tensor(y_std, dtype=torch.float32, device=device).view(1, 1, -1)
     best_val = float("inf")
     best_epoch = None
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +263,9 @@ def train_loop(
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
+        train_mse = 0.0
+        train_smooth = 0.0
+        train_smooth_w = 0.0
         start = time.time()
         for x_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch} Train", leave=False):
             x_batch = x_batch.to(device)
@@ -255,22 +273,34 @@ def train_loop(
             optimizer.zero_grad()
             if scaler is None:
                 preds = model(x_batch)
-                loss = criterion(preds, y_batch)
+                mse_loss = criterion(preds, y_batch)
+                smooth_loss = smoothness_loss_pos(preds)
+                loss = mse_loss + smooth_lambda * smooth_loss
                 loss.backward()
                 optimizer.step()
             else:
                 with amp.autocast(device_type=device.type):
                     preds = model(x_batch)
-                    loss = criterion(preds, y_batch)
+                    mse_loss = criterion(preds, y_batch)
+                    smooth_loss = smoothness_loss_pos(preds)
+                    loss = mse_loss + smooth_lambda * smooth_loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             train_loss += loss.item() * x_batch.size(0)
+            train_mse += mse_loss.item() * x_batch.size(0)
+            train_smooth += smooth_loss.item() * x_batch.size(0)
+            train_smooth_w += (smooth_lambda * smooth_loss).item() * x_batch.size(0)
 
         train_loss /= len(train_loader.dataset)
+        train_mse /= len(train_loader.dataset)
+        train_smooth /= len(train_loader.dataset)
+        train_smooth_w /= len(train_loader.dataset)
 
         model.eval()
         val_loss = 0.0
+        val_mse = 0.0
+        val_smooth = 0.0
         val_mae = None
         with torch.no_grad():
             for x_batch, y_batch in tqdm(val_loader, desc=f"Epoch {epoch} Val", leave=False):
@@ -278,9 +308,15 @@ def train_loop(
                 y_batch = y_batch.to(device)
                 preds = model(x_batch)
                 loss = criterion(preds, y_batch)
+                smooth = smoothness_loss_pos(preds)
                 val_loss += loss.item() * x_batch.size(0)
+                val_mse += loss.item() * x_batch.size(0)
+                val_smooth += smooth.item() * x_batch.size(0)
 
             val_loss /= len(val_loader.dataset)
+            val_mse /= len(val_loader.dataset)
+            val_smooth /= len(val_loader.dataset)
+            val_total = val_mse + smooth_lambda * val_smooth
 
             # Compute MAE in physical space on validation set
             all_pred = []
@@ -297,7 +333,9 @@ def train_loop(
 
         elapsed = time.time() - start
         print(
-            f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} "
+            f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | train_mse={train_mse:.6f} "
+            f"| train_smooth={train_smooth:.6f} | train_smooth_w={train_smooth_w:.6f} "
+            f"| val_loss={val_loss:.6f} | val_mse={val_mse:.6f} | val_smooth={val_smooth:.6f} | val_total={val_total:.6f} "
             f"| val_mae=[{val_mae[0]:.4f}, {val_mae[1]:.4f}, {val_mae[2]:.4f}] | {elapsed:.1f}s"
         )
 
@@ -305,7 +343,13 @@ def train_loop(
             {
                 "epoch": epoch,
                 "train_loss": float(train_loss),
+                "train_mse": float(train_mse),
                 "val_loss": float(val_loss),
+                "val_mse": float(val_mse),
+                "train_smooth": float(train_smooth),
+                "train_smooth_w": float(train_smooth_w),
+                "val_smooth": float(val_smooth),
+                "val_total": float(val_total),
                 "val_mae_x": float(val_mae[0]),
                 "val_mae_y": float(val_mae[1]),
                 "val_mae_z": float(val_mae[2]),
@@ -399,6 +443,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=0, help="Save extra checkpoints every N epochs (0=off)")
     parser.add_argument("--early-stop-patience", type=int, default=20, help="Stop if val loss does not improve for N epochs (0 disables early stop)")
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0, help="Minimal improvement on val loss to reset patience")
+    parser.add_argument("--smooth-lambda", type=float, default=0.0, help="Weight for smoothness loss (0 disables)")
     return parser.parse_args()
 
 
@@ -475,6 +520,7 @@ def main() -> None:
         save_every=args.save_every,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
+        smooth_lambda=args.smooth_lambda,
     )
 
     # Save metadata for quick lookup
@@ -489,6 +535,7 @@ def main() -> None:
         "lr": float(args.lr),
         "best_val_loss": float(best_val),
         "best_epoch": int(best_epoch),
+        "smooth_lambda": float(args.smooth_lambda),
     }
     try:
         with open(model_dir / "metadata.json", "w", encoding="utf-8") as f:
