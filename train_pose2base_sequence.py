@@ -10,7 +10,9 @@ Key differences vs train_pose2base.py:
 
 Usage example (project root):
   python -u train_pose2base_sequence.py \
-    --smooth-lambda 0.1 \
+    --lambda-vel 0.01 \
+    --lambda-acc 0.01 \
+    --lambda-bound 100 \
     --model-name seq_exp \
     --epochs 200 \
     --batch-size 256 \
@@ -219,13 +221,29 @@ def compute_mae_physical(pred_norm: np.ndarray, gt_norm: np.ndarray, y_mean: np.
 
 # =============== Smoothness ===============
 
-def smoothness_loss_pos(pred_pos: torch.Tensor) -> torch.Tensor:
-    """Second-order difference smoothness over x,y in physical space."""
-    p = pred_pos[..., :2]  # use x,y only
-    if p.size(1) < 3:
-        return p.new_tensor(0.0)
-    d2 = p[:, 2:, :] - 2.0 * p[:, 1:-1, :] + p[:, :-2, :]
-    return (d2 ** 2).mean()
+def first_order_smooth_loss(pred: torch.Tensor) -> torch.Tensor:
+    """Velocity smoothness over normalized preds (x,y,z)."""
+    if pred.size(1) < 2:
+        return pred.new_tensor(0.0)
+    dp = pred[:, 1:, :] - pred[:, :-1, :]
+    return (dp ** 2).mean()
+
+
+def second_order_smooth_loss(pred: torch.Tensor) -> torch.Tensor:
+    """Acceleration smoothness over normalized preds (x,y,z)."""
+    if pred.size(1) < 3:
+        return pred.new_tensor(0.0)
+    d2p = pred[:, 2:, :] - 2.0 * pred[:, 1:-1, :] + pred[:, :-2, :]
+    return (d2p ** 2).mean()
+
+
+def step_bound_loss(pred: torch.Tensor, max_bounds: torch.Tensor) -> torch.Tensor:
+    """Hinge penalty for per-step displacement limits using normalized bounds."""
+    if pred.size(1) < 2:
+        return pred.new_tensor(0.0)
+    dp = torch.abs(pred[:, 1:, :] - pred[:, :-1, :])
+    excess = torch.relu(dp - max_bounds)
+    return (excess ** 2).mean()
 
 
 # =============== Training ===============
@@ -249,11 +267,15 @@ def train_loop(
     early_stop_patience: int,
     early_stop_min_delta: float,
     smooth_lambda: float,
+    lambda_vel: float,
+    lambda_acc: float,
+    lambda_bound: float,
 ):
     criterion = nn.MSELoss()
     y_mean_t = torch.tensor(y_mean, dtype=torch.float32, device=device).view(1, 1, -1)
     y_std_t = torch.tensor(y_std, dtype=torch.float32, device=device).view(1, 1, -1)
-    best_val = float("inf")
+    max_bounds_norm = torch.tensor([500.0, 500.0, 200.0], dtype=torch.float32, device=device).view(1, 1, -1) / y_std_t
+    best_total = float("inf")
     best_epoch = None
     save_path.parent.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -264,8 +286,16 @@ def train_loop(
         model.train()
         train_loss = 0.0
         train_mse = 0.0
-        train_smooth = 0.0
-        train_smooth_w = 0.0
+        train_vel = 0.0
+        train_acc = 0.0
+        train_bound = 0.0
+        train_vel_w = 0.0
+        train_acc_w = 0.0
+        train_bound_w = 0.0
+        train_vio_xy_rate = 0.0
+        train_vio_z_rate = 0.0
+        train_over_xy = 0.0
+        train_over_z = 0.0
         start = time.time()
         for x_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch} Train", leave=False):
             x_batch = x_batch.to(device)
@@ -274,59 +304,110 @@ def train_loop(
             if scaler is None:
                 preds = model(x_batch)
                 mse_loss = criterion(preds, y_batch)
-                smooth_loss = smoothness_loss_pos(preds)
-                loss = mse_loss + smooth_lambda * smooth_loss
+                vel_loss = first_order_smooth_loss(preds)
+                acc_loss = second_order_smooth_loss(preds)
+                bound_loss = step_bound_loss(preds, max_bounds_norm)
+                loss = mse_loss + lambda_vel * vel_loss + lambda_acc * acc_loss + lambda_bound * bound_loss
+                preds_phys = preds * y_std_t + y_mean_t
                 loss.backward()
                 optimizer.step()
             else:
                 with amp.autocast(device_type=device.type):
                     preds = model(x_batch)
                     mse_loss = criterion(preds, y_batch)
-                    smooth_loss = smoothness_loss_pos(preds)
-                    loss = mse_loss + smooth_lambda * smooth_loss
+                    vel_loss = first_order_smooth_loss(preds)
+                    acc_loss = second_order_smooth_loss(preds)
+                    bound_loss = step_bound_loss(preds, max_bounds_norm)
+                    loss = mse_loss + lambda_vel * vel_loss + lambda_acc * acc_loss + lambda_bound * bound_loss
+                    preds_phys = preds * y_std_t + y_mean_t
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             train_loss += loss.item() * x_batch.size(0)
             train_mse += mse_loss.item() * x_batch.size(0)
-            train_smooth += smooth_loss.item() * x_batch.size(0)
-            train_smooth_w += (smooth_lambda * smooth_loss).item() * x_batch.size(0)
+            train_vel += vel_loss.item() * x_batch.size(0)
+            train_acc += acc_loss.item() * x_batch.size(0)
+            train_bound += bound_loss.item() * x_batch.size(0)
+            train_vel_w += (lambda_vel * vel_loss).item() * x_batch.size(0)
+            train_acc_w += (lambda_acc * acc_loss).item() * x_batch.size(0)
+            train_bound_w += (lambda_bound * bound_loss).item() * x_batch.size(0)
+
+            # Constraint violation metrics in physical space (not used in loss)
+            dp_phys = torch.abs(preds_phys[:, 1:, :] - preds_phys[:, :-1, :]) if preds_phys.size(1) > 1 else preds_phys.new_tensor(0.0)
+            if dp_phys.numel() > 1:
+                dx, dy, dz = dp_phys[..., 0], dp_phys[..., 1], dp_phys[..., 2]
+                vio_xy = ((dx > 500.0) | (dy > 500.0)).float()
+                vio_z = (dz > 200.0).float()
+                over_xy = (torch.relu(dx - 500.0) + torch.relu(dy - 500.0)) * 0.5
+                over_z = torch.relu(dz - 200.0)
+                train_vio_xy_rate += vio_xy.mean().item() * x_batch.size(0)
+                train_vio_z_rate += vio_z.mean().item() * x_batch.size(0)
+                train_over_xy += over_xy.mean().item() * x_batch.size(0)
+                train_over_z += over_z.mean().item() * x_batch.size(0)
 
         train_loss /= len(train_loader.dataset)
         train_mse /= len(train_loader.dataset)
-        train_smooth /= len(train_loader.dataset)
-        train_smooth_w /= len(train_loader.dataset)
+        train_vel /= len(train_loader.dataset)
+        train_acc /= len(train_loader.dataset)
+        train_bound /= len(train_loader.dataset)
+        train_vel_w /= len(train_loader.dataset)
+        train_acc_w /= len(train_loader.dataset)
+        train_bound_w /= len(train_loader.dataset)
+        train_vio_xy_rate /= len(train_loader.dataset)
+        train_vio_z_rate /= len(train_loader.dataset)
+        train_over_xy /= len(train_loader.dataset)
+        train_over_z /= len(train_loader.dataset)
 
         model.eval()
-        val_loss = 0.0
         val_mse = 0.0
-        val_smooth = 0.0
+        val_vel = 0.0
+        val_acc = 0.0
+        val_bound = 0.0
+        val_vio_xy_rate = 0.0
+        val_vio_z_rate = 0.0
+        val_over_xy = 0.0
+        val_over_z = 0.0
         val_mae = None
         with torch.no_grad():
+            all_pred = []
+            all_gt = []
             for x_batch, y_batch in tqdm(val_loader, desc=f"Epoch {epoch} Val", leave=False):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
                 preds = model(x_batch)
                 loss = criterion(preds, y_batch)
-                smooth = smoothness_loss_pos(preds)
-                val_loss += loss.item() * x_batch.size(0)
+                vel_loss = first_order_smooth_loss(preds)
+                acc_loss = second_order_smooth_loss(preds)
+                bound_loss = step_bound_loss(preds, max_bounds_norm)
                 val_mse += loss.item() * x_batch.size(0)
-                val_smooth += smooth.item() * x_batch.size(0)
+                val_vel += vel_loss.item() * x_batch.size(0)
+                val_acc += acc_loss.item() * x_batch.size(0)
+                val_bound += bound_loss.item() * x_batch.size(0)
+                preds_phys = preds * y_std_t + y_mean_t
+                dp_phys = torch.abs(preds_phys[:, 1:, :] - preds_phys[:, :-1, :]) if preds_phys.size(1) > 1 else preds_phys.new_tensor(0.0)
+                if dp_phys.numel() > 1:
+                    dx, dy, dz = dp_phys[..., 0], dp_phys[..., 1], dp_phys[..., 2]
+                    vio_xy = ((dx > 500.0) | (dy > 500.0)).float()
+                    vio_z = (dz > 200.0).float()
+                    over_xy = (torch.relu(dx - 500.0) + torch.relu(dy - 500.0)) * 0.5
+                    over_z = torch.relu(dz - 200.0)
+                    val_vio_xy_rate += vio_xy.mean().item() * x_batch.size(0)
+                    val_vio_z_rate += vio_z.mean().item() * x_batch.size(0)
+                    val_over_xy += over_xy.mean().item() * x_batch.size(0)
+                    val_over_z += over_z.mean().item() * x_batch.size(0)
+                all_pred.append(preds.cpu().numpy())
+                all_gt.append(y_batch.cpu().numpy())
 
-            val_loss /= len(val_loader.dataset)
             val_mse /= len(val_loader.dataset)
-            val_smooth /= len(val_loader.dataset)
-            val_total = val_mse + smooth_lambda * val_smooth
+            val_vel /= len(val_loader.dataset)
+            val_acc /= len(val_loader.dataset)
+            val_bound /= len(val_loader.dataset)
+            val_vio_xy_rate /= len(val_loader.dataset)
+            val_vio_z_rate /= len(val_loader.dataset)
+            val_over_xy /= len(val_loader.dataset)
+            val_over_z /= len(val_loader.dataset)
+            val_loss = val_mse + lambda_vel * val_vel + lambda_acc * val_acc + lambda_bound * val_bound
 
-            # Compute MAE in physical space on validation set
-            all_pred = []
-            all_gt = []
-            for x_batch, y_batch in val_loader:
-                x_batch = x_batch.to(device)
-                with torch.no_grad():
-                    preds = model(x_batch).cpu().numpy()
-                all_pred.append(preds)
-                all_gt.append(y_batch.numpy())
             all_pred = np.concatenate(all_pred, axis=0)
             all_gt = np.concatenate(all_gt, axis=0)
             val_mae = compute_mae_physical(all_pred, all_gt, y_mean, y_std)
@@ -334,8 +415,11 @@ def train_loop(
         elapsed = time.time() - start
         print(
             f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | train_mse={train_mse:.6f} "
-            f"| train_smooth={train_smooth:.6f} | train_smooth_w={train_smooth_w:.6f} "
-            f"| val_loss={val_loss:.6f} | val_mse={val_mse:.6f} | val_smooth={val_smooth:.6f} | val_total={val_total:.6f} "
+            f"| train_vel={train_vel:.6f} | train_acc={train_acc:.6f} | train_bound={train_bound:.6f} "
+            f"| train_vel_w={train_vel_w:.6f} | train_acc_w={train_acc_w:.6f} | train_bound_w={train_bound_w:.6f} "
+            f"| train_vio_xy={train_vio_xy_rate:.6f} | train_vio_z={train_vio_z_rate:.6f} | train_over_xy={train_over_xy:.6f} | train_over_z={train_over_z:.6f} "
+            f"| val_mse={val_mse:.6f} | val_loss={val_loss:.6f} | val_vel={val_vel:.6f} | val_acc={val_acc:.6f} | val_bound={val_bound:.6f} "
+            f"| val_vio_xy={val_vio_xy_rate:.6f} | val_vio_z={val_vio_z_rate:.6f} | val_over_xy={val_over_xy:.6f} | val_over_z={val_over_z:.6f} "
             f"| val_mae=[{val_mae[0]:.4f}, {val_mae[1]:.4f}, {val_mae[2]:.4f}] | {elapsed:.1f}s"
         )
 
@@ -344,12 +428,28 @@ def train_loop(
                 "epoch": epoch,
                 "train_loss": float(train_loss),
                 "train_mse": float(train_mse),
-                "val_loss": float(val_loss),
                 "val_mse": float(val_mse),
-                "train_smooth": float(train_smooth),
-                "train_smooth_w": float(train_smooth_w),
-                "val_smooth": float(val_smooth),
-                "val_total": float(val_total),
+                "val_loss": float(val_loss),
+                "train_vel": float(train_vel),
+                "train_acc": float(train_acc),
+                "train_bound": float(train_bound),
+                "train_vel_w": float(train_vel_w),
+                "train_acc_w": float(train_acc_w),
+                "train_bound_w": float(train_bound_w),
+                "train_vio_xy_rate": float(train_vio_xy_rate),
+                "train_vio_z_rate": float(train_vio_z_rate),
+                "train_over_xy": float(train_over_xy),
+                "train_over_z": float(train_over_z),
+                "val_vel": float(val_vel),
+                "val_acc": float(val_acc),
+                "val_bound": float(val_bound),
+                "val_vio_xy_rate": float(val_vio_xy_rate),
+                "val_vio_z_rate": float(val_vio_z_rate),
+                "val_over_xy": float(val_over_xy),
+                "val_over_z": float(val_over_z),
+                "lambda_vel": float(lambda_vel),
+                "lambda_acc": float(lambda_acc),
+                "lambda_bound": float(lambda_bound),
                 "val_mae_x": float(val_mae[0]),
                 "val_mae_y": float(val_mae[1]),
                 "val_mae_z": float(val_mae[2]),
@@ -364,9 +464,8 @@ def train_loop(
                 scheduler.step(val_loss)
             except Exception as exc:
                 print(f"[warn] LR scheduler step failed: {exc}")
-
-        if val_loss < best_val - early_stop_min_delta:
-            best_val = val_loss
+        if val_loss < best_total - early_stop_min_delta:
+            best_total = val_loss
             ckpt = {
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -415,7 +514,7 @@ def train_loop(
             print(f"[early-stop] No val improvement for {early_stop_counter} epochs. Stopping early at epoch {epoch}.")
             break
 
-    return best_val, best_epoch if best_epoch is not None else epoch
+    return best_total, best_epoch if best_epoch is not None else epoch
 
 
 # =============== Main ===============
@@ -444,6 +543,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=20, help="Stop if val loss does not improve for N epochs (0 disables early stop)")
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0, help="Minimal improvement on val loss to reset patience")
     parser.add_argument("--smooth-lambda", type=float, default=0.0, help="Weight for smoothness loss (0 disables)")
+    parser.add_argument("--lambda-vel", type=float, default=0.0, help="Weight for first-order smoothness (velocity) loss")
+    parser.add_argument("--lambda-acc", type=float, default=0.0, help="Weight for second-order smoothness (acceleration) loss")
+    parser.add_argument("--lambda-bound", type=float, default=0.0, help="Weight for per-step displacement bound loss")
     return parser.parse_args()
 
 
@@ -502,7 +604,7 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory)
 
     print(f"Device: {device} | AMP: {use_amp} | Save to: {model_path}")
-    best_val, best_epoch = train_loop(
+    best_total, best_epoch = train_loop(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -521,6 +623,9 @@ def main() -> None:
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         smooth_lambda=args.smooth_lambda,
+        lambda_vel=args.lambda_vel,
+        lambda_acc=args.lambda_acc,
+        lambda_bound=args.lambda_bound,
     )
 
     # Save metadata for quick lookup
@@ -533,9 +638,12 @@ def main() -> None:
         "epochs": int(args.epochs),
         "batch_size": int(args.batch_size),
         "lr": float(args.lr),
-        "best_val_loss": float(best_val),
+        "best_total": float(best_total),
         "best_epoch": int(best_epoch),
         "smooth_lambda": float(args.smooth_lambda),
+        "lambda_vel": float(args.lambda_vel),
+        "lambda_acc": float(args.lambda_acc),
+        "lambda_bound": float(args.lambda_bound),
     }
     try:
         with open(model_dir / "metadata.json", "w", encoding="utf-8") as f:
